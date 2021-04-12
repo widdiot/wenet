@@ -20,9 +20,10 @@
 #include <string>
 #include <vector>
 
+#include "glog/logging.h"
+
 #include "frontend/fbank.h"
 #include "utils/blocking_queue.h"
-#include "utils/log.h"
 
 namespace wenet {
 

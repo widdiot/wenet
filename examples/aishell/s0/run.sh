@@ -220,7 +220,5 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
             --batch_size 1 \
             --dict $dict \
             --result_file $ali_result \
-            --gen_praat
 
 fi
-

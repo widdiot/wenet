@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "gflags/gflags.h"
+#include "glog/logging.h"
+
+#include "decoder/symbol_table.h"
 #include "decoder/torch_asr_decoder.h"
 #include "decoder/torch_asr_model.h"
 #include "frontend/feature_pipeline.h"
-#include "utils/flags.h"
-#include "utils/log.h"
 #include "websocket/websocket_server.h"
 
 DEFINE_int32(port, 10086, "websocket listening port");
@@ -36,8 +38,7 @@ int main(int argc, char *argv[]) {
   auto decode_config = std::make_shared<wenet::DecodeOptions>();
   decode_config->chunk_size = FLAGS_chunk_size;
   decode_config->num_left_chunks = FLAGS_num_left_chunks;
-  auto symbol_table = std::shared_ptr<fst::SymbolTable>(
-      fst::SymbolTable::ReadText(FLAGS_dict_path));
+  auto symbol_table = std::make_shared<wenet::SymbolTable>(FLAGS_dict_path);
   auto model = std::make_shared<wenet::TorchAsrModel>();
   model->Read(FLAGS_model_path);
 

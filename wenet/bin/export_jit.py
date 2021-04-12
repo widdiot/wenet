@@ -19,7 +19,8 @@ import os
 
 import torch
 import yaml
-
+import sys
+sys.path.append("/home/vishay/repos/wenet/")
 from wenet.transformer.asr_model import init_asr_model
 from wenet.utils.checkpoint import load_checkpoint
 

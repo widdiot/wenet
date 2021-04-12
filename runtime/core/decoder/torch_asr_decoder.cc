@@ -8,29 +8,23 @@
 #include <limits>
 #include <utility>
 
-#include "decoder/ctc_endpoint.h"
-
 namespace wenet {
 
 TorchAsrDecoder::TorchAsrDecoder(
     std::shared_ptr<FeaturePipeline> feature_pipeline,
-    std::shared_ptr<TorchAsrModel> model,
-    std::shared_ptr<fst::SymbolTable> symbol_table, const DecodeOptions& opts)
+    std::shared_ptr<TorchAsrModel> model, const SymbolTable& symbol_table,
+    const DecodeOptions& opts)
     : feature_pipeline_(std::move(feature_pipeline)),
       model_(std::move(model)),
       symbol_table_(symbol_table),
       opts_(opts),
-      ctc_prefix_beam_searcher_(new CtcPrefixBeamSearch(opts.ctc_search_opts)),
-      ctc_endpointer_(new CtcEndpoint(opts.ctc_endpoint_config)) {
-  ctc_endpointer_->frame_shift_in_ms(frame_shift_in_ms());
+      ctc_prefix_beam_searcher_(new CtcPrefixBeamSearch(opts.ctc_search_opts)) {
 }
 
 void TorchAsrDecoder::Reset() {
   start_ = false;
   result_.clear();
   offset_ = 0;
-  num_frames_ = 0;
-  global_frame_offset_ = 0;
   num_frames_in_current_chunk_ = 0;
   subsampling_cache_ = std::move(torch::jit::IValue());
   elayers_output_cache_ = std::move(torch::jit::IValue());
@@ -39,40 +33,26 @@ void TorchAsrDecoder::Reset() {
   cached_feature_.clear();
   ctc_prefix_beam_searcher_->Reset();
   feature_pipeline_->Reset();
-  ctc_endpointer_->Reset();
 }
 
-void TorchAsrDecoder::ResetContinuousDecoding() {
-  global_frame_offset_ = num_frames_;
-  start_ = false;
-  result_.clear();
-  offset_ = 0;
-  num_frames_in_current_chunk_ = 0;
-  subsampling_cache_ = std::move(torch::jit::IValue());
-  elayers_output_cache_ = std::move(torch::jit::IValue());
-  conformer_cnn_cache_ = std::move(torch::jit::IValue());
-  encoder_outs_.clear();
-  cached_feature_.clear();
-  ctc_prefix_beam_searcher_->Reset();
-  ctc_endpointer_->Reset();
+bool TorchAsrDecoder::Decode() {
+  bool finish = this->AdvanceDecoding();
+  if (finish) {
+    // Do attention rescoring
+    auto start = std::chrono::steady_clock::now();
+    AttentionRescoring();
+    auto end = std::chrono::steady_clock::now();
+    LOG(INFO) << "Rescoring cost latency: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(end -
+                                                                       start)
+                     .count()
+              << "ms.";
+    return true;
+  }
+  return false;
 }
 
-DecodeState TorchAsrDecoder::Decode() { return this->AdvanceDecoding(); }
-
-void TorchAsrDecoder::Rescoring() {
-  // Do attention rescoring
-  auto start = std::chrono::steady_clock::now();
-  AttentionRescoring();
-  auto end = std::chrono::steady_clock::now();
-  LOG(INFO) << "Rescoring cost latency: "
-            << std::chrono::duration_cast<std::chrono::milliseconds>(end -
-                                                                     start)
-                   .count()
-            << "ms.";
-}
-
-DecodeState TorchAsrDecoder::AdvanceDecoding() {
-  DecodeState state = DecodeState::kEndBatch;
+bool TorchAsrDecoder::AdvanceDecoding() {
   const int subsampling_rate = model_->subsampling_rate();
   const int right_context = model_->right_context();
   const int cached_feature_size = 1 + right_context - subsampling_rate;
@@ -92,11 +72,8 @@ DecodeState TorchAsrDecoder::AdvanceDecoding() {
   }
   std::vector<std::vector<float>> chunk_feats;
   // If not okay, that means we reach the end of the input
-  if (!feature_pipeline_->Read(num_requried_frames, &chunk_feats)) {
-    state = DecodeState::kEndFeats;
-  }
+  bool finish = !feature_pipeline_->Read(num_requried_frames, &chunk_feats);
   num_frames_in_current_chunk_ = chunk_feats.size();
-  num_frames_ += chunk_feats.size();
   LOG(INFO) << "Required " << num_requried_frames << " get "
             << chunk_feats.size();
   int num_frames = cached_feature_.size() + chunk_feats.size();
@@ -143,15 +120,11 @@ DecodeState TorchAsrDecoder::AdvanceDecoding() {
                                       ->run_method("ctc_activation", chunk_out)
                                       .toTensor()[0];
     encoder_outs_.push_back(std::move(chunk_out));
-    UpdateResult(ctc_log_probs);
-
-    if (ctc_endpointer_->IsEndpoint(ctc_log_probs, DecodedSomething())) {
-      LOG(INFO) << "Endpoint is detected at " << num_frames_;
-      state = DecodeState::kEndpoint;
-    }
+    ctc_prefix_beam_searcher_->Search(ctc_log_probs);
+    UpdateResult();
 
     // 3. cache feature for next chunk
-    if (state == DecodeState::kEndBatch) {
+    if (!finish) {
       // TODO(Binbin Zhang): Only deal the case when
       // chunk_feats.size() > cached_feature_size_ here, and it's consistent
       // with our current model, refine it later if we have new model or
@@ -166,53 +139,47 @@ DecodeState TorchAsrDecoder::AdvanceDecoding() {
   }
 
   start_ = true;
-  return state;
+  return finish;
 }
 
-void TorchAsrDecoder::UpdateResult(const torch::Tensor& ctc_log_probs) {
-  ctc_prefix_beam_searcher_->Search(ctc_log_probs);
+void TorchAsrDecoder::UpdateResult() {
   const auto& hypotheses = ctc_prefix_beam_searcher_->hypotheses();
   const auto& likelihood = ctc_prefix_beam_searcher_->likelihood();
   const auto& times = ctc_prefix_beam_searcher_->times();
+  int ms_per_step = model_->subsampling_rate() *
+          feature_pipeline_->config().frame_shift *
+          1000 / feature_pipeline_->config().sample_rate;
   result_.clear();
 
   CHECK_EQ(hypotheses.size(), likelihood.size());
   CHECK_EQ(hypotheses.size(), times.size());
   for (size_t i = 0; i < hypotheses.size(); i++) {
-    const std::vector<int>& hypothesis = hypotheses[i];
-    const std::vector<int>& time_stamp = times[i];
+    std::vector<int> hypothesis = hypotheses[i];
+    std::vector<int> time_stamp = times[i];
     CHECK_EQ(hypothesis.size(), time_stamp.size());
 
     DecodeResult path;
     path.score = likelihood[i];
-    int offset = global_frame_offset_ * feature_frame_shift_in_ms();
+    int start = 0;
     for (size_t j = 0; j < hypothesis.size(); j++) {
-      std::string word = symbol_table_->Find(hypothesis[j]);
+      std::string word = symbol_table_.Find(hypothesis[j]);
       path.sentence += word;
-      int start = j > 0 ? time_stamp[j - 1] * frame_shift_in_ms() : 0;
-      int end = time_stamp[j] * frame_shift_in_ms();
-      WordPiece word_piece(word, offset + start, offset + end);
+
+      WordPiece word_piece(word, start, time_stamp[j] * ms_per_step);
       path.word_pieces.emplace_back(word_piece);
       start = word_piece.end;
     }
     path.sentence = ProcessBlank(path.sentence);
     result_.emplace_back(path);
   }
-
-  if (DecodedSomething()) {
-    VLOG(1) << "Partial CTC result " << result_[0].sentence;
-  }
+  VLOG(1) << "Partial CTC result " << result_[0].sentence;
 }
 
 void TorchAsrDecoder::AttentionRescoring() {
   int sos = model_->sos();
   int eos = model_->eos();
-  const auto& hypotheses = ctc_prefix_beam_searcher_->hypotheses();
+  auto hypotheses = ctc_prefix_beam_searcher_->hypotheses();
   int num_hyps = hypotheses.size();
-  if (num_hyps <= 0) {
-    return;
-  }
-
   torch::NoGradGuard no_grad;
   // Step 1: Prepare input for libtorch
   torch::Tensor hyps_length = torch::zeros({num_hyps}, torch::kLong);

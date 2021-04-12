@@ -24,7 +24,7 @@
 
 namespace wenet {
 
-#define WENET_DISALLOW_COPY_AND_ASSIGN(Type) \
+#define DISALLOW_COPY_AND_ASSIGN(Type) \
   Type(const Type &) = delete;         \
   Type &operator=(const Type &) = delete;
 

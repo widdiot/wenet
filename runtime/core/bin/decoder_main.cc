@@ -5,14 +5,15 @@
 #include <iomanip>
 #include <utility>
 
+#include "gflags/gflags.h"
+#include "glog/logging.h"
 #include "torch/script.h"
 
+#include "decoder/symbol_table.h"
 #include "decoder/torch_asr_decoder.h"
 #include "decoder/torch_asr_model.h"
 #include "frontend/feature_pipeline.h"
 #include "frontend/wav.h"
-#include "utils/flags.h"
-#include "utils/log.h"
 #include "utils/utils.h"
 
 DEFINE_int32(num_bins, 80, "num mel bins for fbank feature");
@@ -32,8 +33,7 @@ int main(int argc, char *argv[]) {
 
   auto model = std::make_shared<wenet::TorchAsrModel>();
   model->Read(FLAGS_model_path, FLAGS_num_threads);
-  auto symbol_table = std::shared_ptr<fst::SymbolTable>(
-      fst::SymbolTable::ReadText(FLAGS_dict_path));
+  wenet::SymbolTable symbol_table(FLAGS_dict_path);
   wenet::DecodeOptions decode_config;
   decode_config.chunk_size = FLAGS_chunk_size;
   decode_config.num_left_chunks = FLAGS_num_left_chunks;
@@ -85,20 +85,15 @@ int main(int argc, char *argv[]) {
     int decode_time = 0;
     while (true) {
       auto start = std::chrono::steady_clock::now();
-      wenet::DecodeState state = decoder.Decode();
-      if (state == wenet::DecodeState::kEndFeats) {
-        decoder.Rescoring();
-      }
+      bool finish = decoder.Decode();
       auto end = std::chrono::steady_clock::now();
       auto chunk_decode_time =
           std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
               .count();
       decode_time += chunk_decode_time;
-      if (decoder.DecodedSomething()) {
-        LOG(INFO) << "Partial result: " << decoder.result()[0].sentence;
-      }
+      LOG(INFO) << "Partial result: " << decoder.result()[0].sentence;
 
-      if (state == wenet::DecodeState::kEndFeats) {
+      if (finish) {
         break;
       } else if (FLAGS_chunk_size > 0 && FLAGS_simulate_streaming) {
         float frame_shift_in_ms =

@@ -14,7 +14,7 @@
 
 #include "utils/utils.h"
 
-#include "utils/log.h"
+#include "glog/logging.h"
 
 namespace wenet {
 

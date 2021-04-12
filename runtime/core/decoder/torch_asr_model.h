@@ -34,7 +34,7 @@ class TorchAsrModel {
   int eos_ = 0;
 
  public:
-  WENET_DISALLOW_COPY_AND_ASSIGN(TorchAsrModel);
+  DISALLOW_COPY_AND_ASSIGN(TorchAsrModel);
 };
 
 }  // namespace wenet
